@@ -2221,7 +2221,9 @@ dependencies = [
  "anyhow",
  "eframe",
  "env_logger",
+ "log",
  "rfd",
+ "walkdir",
 ]
 
 [[package]]
