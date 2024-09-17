@@ -1,6 +1,6 @@
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
@@ -9,6 +9,7 @@ use anyhow::{Context, Result};
 use eframe::egui;
 use eframe::egui::ahash::HashMap;
 use log::debug;
+use rayon::prelude::*;
 use walkdir::WalkDir;
 
 type Progress = (String, f32);
@@ -24,20 +25,39 @@ fn main() -> Result<()> {
     };
 
     thread::spawn(move || {
-        while let Ok(received) = rx_process.recv() {
-            debug!("got .obj to process: {}", received);
-            let _ = tx_progress.send((received, 12.5));
-        }
-        // let lines = read_lines("c:/work/_help/_sunix/terra_obj/BlockBABY/BlockBABY.obj")?;
-        // for line in lines.flatten() {
+        while let Ok(received_file) = rx_process.recv() {
+            let (lines, file_size) = read_lines(&received_file).unwrap();
+            debug!("got .obj to process: {} / {}", received_file, file_size);
 
-        //     match &line[..2] {
-        //         "v " => {
-        //             println!("{}", translate_vertex(&line)?)
-        //         }
-        //         _ => println!("{}", line),
-        //     }
-        // }
+            let input_path = Path::new(&received_file);
+            let output_path = input_path.parent().unwrap().join(format!(
+                "{}_tr.obj",
+                input_path.file_stem().unwrap().to_str().unwrap()
+            ));
+
+            let mut output = File::create(output_path).unwrap();
+
+            let mut progress_size: usize = 0;
+
+            for (index, line) in lines.map_while(Result::ok).enumerate() {
+                progress_size += line.len() + 1;
+
+                if index % 1_000_000 == 0 {
+                    let progress = progress_size as f64 / file_size as f64;
+                    let _ = tx_progress.send((received_file.clone(), progress as f32));
+                }
+
+                match &line[..2] {
+                    "v " => {
+                        let _ = writeln!(output, "{}", translate_vertex(&line).unwrap());
+                    }
+                    _ => {
+                        let _ = writeln!(output, "{}", line);
+                    }
+                }
+            }
+            let _ = tx_progress.send((received_file.clone(), 1.0)); // %100
+        }
     });
 
     let _ = eframe::run_native(
@@ -55,6 +75,15 @@ fn main() -> Result<()> {
     );
 
     Ok(())
+}
+
+fn read_lines<P>(filename: P) -> io::Result<(io::Lines<io::BufReader<File>>, usize)>
+where
+    P: AsRef<Path>,
+{
+    let file = File::open(filename)?;
+    let file_size = file.metadata().unwrap().len();
+    Ok((io::BufReader::new(file).lines(), file_size as usize))
 }
 
 fn translate_vertex(vstr: &str) -> Result<String> {
@@ -76,14 +105,6 @@ fn translate_vertex(vstr: &str) -> Result<String> {
         .with_context(|| format!("failed to parse Z in line: {}", vstr))?
         + 545.18800000022418;
     Ok(format!("v {} {} {}", x, y, z))
-}
-
-fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
-where
-    P: AsRef<Path>,
-{
-    let file = File::open(filename)?;
-    Ok(io::BufReader::new(file).lines())
 }
 
 #[derive(Default)]
@@ -112,6 +133,8 @@ impl eframe::App for ConvertApp {
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
+            ui.ctx().request_repaint_after_secs(0.2); // to update progress if no event generated
+
             ui.label("Select folder with Block directories and metadata.xml");
 
             if ui.button("Select directory…").clicked() {
