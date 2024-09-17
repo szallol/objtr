@@ -1,36 +1,58 @@
-use anyhow::{Context, Result};
-use eframe::egui;
-use log::debug;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::io::{self, BufRead};
 use std::path::Path;
+use std::sync::mpsc;
+use std::thread;
+
+use anyhow::{Context, Result};
+use eframe::egui;
+use eframe::egui::ahash::HashMap;
+use log::debug;
 use walkdir::WalkDir;
 
+type Progress = (String, f32);
+
 fn main() -> Result<()> {
-    // let lines = read_lines("c:/work/_help/_sunix/terra_obj/BlockBABY/BlockBABY.obj")?;
+    let (tx_process, rx_process) = mpsc::channel::<String>();
+    let (tx_progress, rx_progress) = mpsc::channel::<Progress>();
 
     env_logger::init(); // Log to stderr (if you run with `RUST_LOG=debug`).
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([640.0, 240.0]) // wide enough for the drag-drop overlay text
-            .with_drag_and_drop(false),
+        viewport: egui::ViewportBuilder::default().with_drag_and_drop(false),
         ..Default::default()
     };
+
+    thread::spawn(move || {
+        while let Ok(received) = rx_process.recv() {
+            debug!("got .obj to process: {}", received);
+            let _ = tx_progress.send((received, 12.5));
+        }
+        // let lines = read_lines("c:/work/_help/_sunix/terra_obj/BlockBABY/BlockBABY.obj")?;
+        // for line in lines.flatten() {
+
+        //     match &line[..2] {
+        //         "v " => {
+        //             println!("{}", translate_vertex(&line)?)
+        //         }
+        //         _ => println!("{}", line),
+        //     }
+        // }
+    });
+
     let _ = eframe::run_native(
         ".obj vertex translator",
         options,
-        Box::new(|_cc| Ok(Box::<MyApp>::default())),
+        Box::new(|_cc| {
+            Ok(Box::new(ConvertApp {
+                tx: tx_process,
+                rx_progress,
+                obj_source_path: None,
+                obj_files: None,
+                conver_enabled: false,
+            }))
+        }),
     );
-
-    // for line in lines.flatten() {
-    //     match &line[..2] {
-    //         "v " => {
-    //             println!("{}", translate_vertex(&line)?)
-    //         }
-    //         _ => println!("{}", line),
-    //     }
-    // }
 
     Ok(())
 }
@@ -66,20 +88,29 @@ where
 
 #[derive(Default)]
 struct ObjInfo {
-    path: String,
     checked: bool,
+    progress: f32,
 }
 
-#[derive(Default)]
-struct MyApp {
+struct ConvertApp {
+    tx: mpsc::Sender<String>, // path of the .obj
+    rx_progress: mpsc::Receiver<Progress>,
     obj_source_path: Option<String>,
-    obj_files: Option<Vec<ObjInfo>>,
+    obj_files: Option<HashMap<String, ObjInfo>>,
     conver_enabled: bool,
     // dest_path: Option<String>,
 }
 
-impl eframe::App for MyApp {
+impl eframe::App for ConvertApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Ok(progress) = self.rx_progress.try_recv() {
+            if let Some(obj_files) = &mut self.obj_files {
+                if let Some(obj_file) = obj_files.get_mut(&progress.0) {
+                    obj_file.progress = progress.1;
+                }
+            }
+        }
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.label("Select folder with Block directories and metadata.xml");
 
@@ -99,9 +130,16 @@ impl eframe::App for MyApp {
 
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     if let Some(obj_files) = &mut self.obj_files {
-                        obj_files.iter_mut().for_each(|obj_info| {
-                            ui.checkbox(&mut obj_info.checked, obj_info.path.clone());
-                        })
+                        obj_files.iter_mut().for_each(|(path, obj_info)| {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut obj_info.checked, path);
+                                if obj_info.progress > 0.0 {
+                                    let progress_bar =
+                                        egui::ProgressBar::new(obj_info.progress).show_percentage();
+                                    ui.add(progress_bar);
+                                }
+                            });
+                        });
                     }
                 });
             };
@@ -109,6 +147,12 @@ impl eframe::App for MyApp {
             if self.obj_files.is_some() {
                 ui.add_enabled_ui(self.conver_enabled, |ui| {
                     if ui.button("Convert..").clicked() {
+                        if let Some(obj_files) = &self.obj_files {
+                            obj_files.iter().for_each(|(path, _obj_info)| {
+                                let _ = self.tx.send(path.clone());
+                            });
+                        }
+                        // self.tx.send("csecs".to_owned()).unwrap();
                         debug!("convert clicked");
                         self.conver_enabled = false;
                     }
@@ -118,7 +162,7 @@ impl eframe::App for MyApp {
     }
 }
 
-fn all_obj_files_recursively(search_path: &str) -> Option<Vec<ObjInfo>> {
+fn all_obj_files_recursively(search_path: &str) -> Option<HashMap<String, ObjInfo>> {
     Some(
         WalkDir::new(search_path)
             .into_iter()
@@ -126,9 +170,14 @@ fn all_obj_files_recursively(search_path: &str) -> Option<Vec<ObjInfo>> {
                 // debug!("direntry: {:?}", e.as_ref().unwrap().path().extension());
                 e.as_ref().unwrap().path().extension() == Some(OsStr::new("obj"))
             })
-            .map(|e| ObjInfo {
-                path: e.unwrap().into_path().display().to_string(),
-                checked: true,
+            .map(|e| {
+                (
+                    e.unwrap().into_path().display().to_string(),
+                    ObjInfo {
+                        checked: true,
+                        progress: 0.0,
+                    },
+                )
             })
             .collect(),
     )
